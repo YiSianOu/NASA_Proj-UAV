@@ -1,0 +1,9 @@
+    "mpc_benchmark": {
+        "round_trip_average_hz": 990.4790320034382,
+        "completed_groups": 4953,
+        "attempted_groups": 4953,
+        "timeout_count": 0,
+        "round_trip_p50_ms": 1.00699,
+        "round_trip_p99_ms": 1.3071717999999841,
+        "round_trip_slowest_ms": 1.821198,
+    }

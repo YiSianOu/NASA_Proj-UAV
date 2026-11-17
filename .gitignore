@@ -1,0 +1,40 @@
+# macOS and Windows metadata
+.DS_Store
+.DS_store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100/
+.Trashes/
+__MACOSX/
+Thumbs.db
+Desktop.ini
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local Python environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local environment variables
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Editor temporary files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
