@@ -18,7 +18,7 @@ import sys
 import time
 
 from uio_read_test_valid import BASE, WORDS, find_device
-from uio_write_verify import aligned_snapshots, frame_fields, require_bench_state
+from UIO_rw.uio_write_verify import aligned_snapshots, frame_fields, require_bench_state
 
 
 def reference_xyz(words):
