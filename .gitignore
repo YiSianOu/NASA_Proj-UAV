@@ -38,3 +38,6 @@ ENV/
 *.swp
 *.swo
 *~
+
+# I don't like
+colcon_space.txt
