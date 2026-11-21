@@ -1,4 +1,4 @@
-"""Print PX4 mode, local North/East/Up position and yaw every two seconds."""
+"""Every two seconds: mode, armed, phase, N/E, height relative to takeoff, yaw."""
 
 import json
 import math
@@ -50,11 +50,11 @@ class Monitor(Node):
         if (isinstance(position, (list, tuple)) and len(position) == 3
                 and all(type(v) in (int, float) and math.isfinite(v) for v in position)):
             x, y, down = position
-            altitude = -down
-        print(f"PX4 mode: {mode}\n")
-        print(f"position: x = {number(x)}, y = {number(y)}; altitude: {number(altitude)}\n"
+            altitude = state.get("relative_altitude")
+        print(f"PX4 mode: {mode}; armed: {state.get('armed', '--')}; phase: {state.get('phase', '--')}\n"
+              f"position: x = {number(x)}, y = {number(y)}; altitude: {number(altitude)}\n"
               f"yaw = {number(state.get('yaw_deg'))}\n"
-              "----------------------------------------", flush=True)
+              "-----------------------------------", flush=True)
 
 
 def number(value):

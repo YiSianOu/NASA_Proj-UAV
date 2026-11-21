@@ -3,8 +3,8 @@
 import math
 import unittest
 
-from flight_logic import Flight, Line, MAX_SPEED, Telemetry
-from mode_select import read_request
+from keyboard_flight.flight_logic import Flight, Line, MAX_SPEED, Telemetry
+from keyboard_flight.mode_select import read_request
 
 
 class FlightTests(unittest.TestCase):
