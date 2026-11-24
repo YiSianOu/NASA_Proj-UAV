@@ -175,6 +175,7 @@ class Controller(Node):
         self.t = Telemetry()
         self.px4_setpoint = PX4SetpointTelemetry()
         self.px4_attitude_setpoint = PX4AttitudeTelemetry()
+        self.attitude_rpy_ned_rad = None
         self.px4_boot_epoch = 0
         self.events = self.create_publisher(String, "/flight/event", 20)
         self.states = self.create_publisher(String, "/flight/state", 10)
@@ -257,6 +258,7 @@ class Controller(Node):
                 if delta >= 0x80000000:
                     self.px4_setpoint.clear()
                     self.px4_attitude_setpoint.clear()
+                    self.attitude_rpy_ned_rad = None
                     self.px4_boot_epoch += 1
                     self.flight.invalidate_frame(now)
                     # Old state belongs to the previous clock/frame epoch. Do not
@@ -288,6 +290,10 @@ class Controller(Node):
                 self.flight.warn("yaw_jump", "heading 跳變超過 30°；只警告，不停止串流", now)
             t.yaw = math.remainder(msg.yaw, 2 * math.pi) if math.isfinite(msg.yaw) else None
             t.attitude_at = now
+            # Display-only observation of one complete ATTITUDE packet. Flight
+            # logic continues to use its existing yaw field and validity rules.
+            rpy = (getattr(msg, "roll", math.nan), getattr(msg, "pitch", math.nan), msg.yaw)
+            self.attitude_rpy_ned_rad = rpy if finite_vector(rpy) else None
         elif kind == "EXTENDED_SYS_STATE":
             t.landed = LANDED.get(msg.landed_state, "UNKNOWN")
             t.landed_at = now
@@ -330,10 +336,15 @@ class Controller(Node):
                        if self.boot_ms is not None and self.boot_received_at is not None else None)
         online = now - t.heartbeat_at < 3
         position = t.position if now - t.position_at < 0.5 and finite_vector(t.position) else None
+        rpy = self.attitude_rpy_ned_rad if (0 <= now - t.attitude_at < .5
+                                           and finite_vector(self.attitude_rpy_ned_rad)) else None
         state = dict(phase=self.flight.phase, mode=t.mode if online else "UNKNOWN",
                      armed=t.armed if online else None,
                      landed=t.landed if now - t.landed_at < 2 else "UNKNOWN",
                      yaw_deg=math.degrees(t.yaw) if t.yaw is not None and now - t.attitude_at < 0.5 else None,
+                     roll_deg=math.degrees(rpy[0]) if rpy is not None else None,
+                     pitch_deg=math.degrees(rpy[1]) if rpy is not None else None,
+                     attitude_rpy_ned_rad=rpy,
                      speed=math.hypot(*t.velocity) if position is not None and finite_vector(t.velocity) else None,
                      position_ned=position,
                      position_time_boot_ms=self.boot_ms if position is not None else None,

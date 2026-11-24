@@ -556,6 +556,7 @@ class AdapterTests(unittest.TestCase):
         c.boot_received_at = 10.
         c.px4_setpoint = module.PX4SetpointTelemetry()
         c.px4_attitude_setpoint = module.PX4AttitudeTelemetry()
+        c.attitude_rpy_ned_rad = None
         c.px4_boot_epoch = 0
         c.t = Telemetry(mode="OFFBOARD", armed=True, landed="AIR", position=(2., 3., -4.25),
                         velocity=(.1, 0., 0.), yaw=0., estimate_ok=True,
@@ -615,6 +616,44 @@ class AdapterTests(unittest.TestCase):
                       afx=0., afy=0., afz=0., yaw=.5, yaw_rate=.01)
         fields.update(updates)
         return self.packet("POSITION_TARGET_LOCAL_NED", **fields)
+
+    def test_measured_attitude_forwarded_as_one_sample_without_control_commands(self):
+        c = self.make_controller()
+        rpy = tuple(map(math.radians, (30., -20., 60.)))
+        c.receive(self.packet("ATTITUDE", roll=rpy[0], pitch=rpy[1], yaw=rpy[2]), 10.)
+        c.snapshot(10.1)
+        state = json.loads(c.states.publish.call_args.args[0].data)
+        self.assertEqual(state["attitude_rpy_ned_rad"], list(rpy))
+        for key, expected in (("roll_deg", 30.), ("pitch_deg", -20.), ("yaw_deg", 60.)):
+            self.assertAlmostEqual(state[key], expected)
+        self.assertAlmostEqual(c.t.yaw, rpy[2])
+        self.assertEqual(c.flight.phase, "HOLD")
+        c.flight.send_command.assert_not_called()
+        c.flight.send_target.assert_not_called()
+
+    def test_measured_attitude_does_not_fabricate_missing_or_invalid_angles(self):
+        for fields in (dict(yaw=.2), dict(roll=math.nan, pitch=.1, yaw=.2),
+                       dict(roll=.1, pitch=math.inf, yaw=.2), dict(roll=.1, pitch=.2, yaw=math.nan)):
+            c = self.make_controller()
+            c.receive(self.packet("ATTITUDE", **fields), 10.)
+            c.snapshot(10.)
+            state = json.loads(c.states.publish.call_args.args[0].data)
+            self.assertIsNone(state["attitude_rpy_ned_rad"])
+            self.assertIsNone(state["roll_deg"])
+            self.assertIsNone(state["pitch_deg"])
+            if math.isfinite(fields["yaw"]):
+                self.assertAlmostEqual(state["yaw_deg"], math.degrees(.2))
+
+    def test_measured_attitude_expires_and_px4_restart_clears_sample(self):
+        c = self.make_controller()
+        c.receive(self.packet("ATTITUDE", roll=.1, pitch=.2, yaw=.3), 10.)
+        c.snapshot(10.5)
+        state = json.loads(c.states.publish.call_args.args[0].data)
+        self.assertIsNone(state["attitude_rpy_ned_rad"])
+        self.assertIsNone(state["roll_deg"])
+        c.receive(self.packet("LOCAL_POSITION_NED", time_boot_ms=100, x=2., y=3., z=-4.,
+                              vx=0., vy=0., vz=0.), 10.6)
+        self.assertIsNone(c.attitude_rpy_ned_rad)
 
     def test_px4_setpoint_request_and_independent_received_source(self):
         c = self.make_controller()
