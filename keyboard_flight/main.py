@@ -13,7 +13,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile
 from std_msgs.msg import String
 
-from .flight_logic import Flight, Telemetry
+from .flight_logic import Flight, Telemetry, finite_vector
 
 M = mavutil.mavlink
 COMMANDS = {"arm": M.MAV_CMD_COMPONENT_ARM_DISARM,
@@ -61,6 +61,7 @@ class Controller(Node):
         if hasattr(getattr(self.link, "port", None), "write_timeout"):
             self.link.port.write_timeout = 0.05
         self.boot_ms = None
+        self.boot_received_at = None
         self.next_heartbeat = self.next_rates = self.next_state = 0.0
         self.next_parameters = 0.0
         self.steady = Clock(clock_type=ClockType.STEADY_TIME)
@@ -89,8 +90,12 @@ class Controller(Node):
 
     def send_target(self, position, yaw, velocity=None):
         now = time.monotonic()
-        stamp = (self.boot_ms + int(1000 * (now - self.t.position_at))) & 0xffffffff
+        # Clock correspondence must not depend on validity of position/velocity.
+        stamp = (self.boot_ms + int(1000 * (now - self.boot_received_at))) & 0xffffffff
         mask = POSITION_YAW_MASK if velocity is None else VELOCITY_YAW_MASK
+        if yaw is None:
+            mask |= M.POSITION_TARGET_TYPEMASK_YAW_IGNORE
+            yaw = 0.
         p = position if velocity is None else (0., 0., 0.)
         v = (0., 0., 0.) if velocity is None else velocity
         self.link.mav.set_position_target_local_ned_send(
@@ -120,15 +125,22 @@ class Controller(Node):
                 if delta == 0:
                     return
                 if delta >= 0x80000000:
-                    self.flight.fault(now, "飛控定位時間重置")
+                    self.flight.invalidate_frame(now)
+                    # Old state belongs to the previous clock/frame epoch. Do not
+                    # fabricate a disarm or mode change before a new heartbeat.
                     t.heartbeat_at = t.landed_at = t.estimator_at = t.attitude_at = -math.inf
+                    t.position = t.velocity = t.yaw = None
+                    t.landed = "UNKNOWN"
+                    t.estimate_ok = False
+                    t.estimator_flags = None
             pos = (msg.x, msg.y, msg.z)
             vel = (msg.vx, msg.vy, msg.vz)
             self.boot_ms = timestamp
+            self.boot_received_at = now
             if all(map(math.isfinite, (*pos, *vel))):
                 if (self.flight.target is not None and t.position is not None
                         and math.dist(pos, t.position) > 0.3 and now - t.position_at < 0.5):
-                    self.flight.fault(now, "本地定位跳變，停止外部目標串流")
+                    self.flight.warn("position_jump", "本地定位跳變超過 0.3 m；只警告，不猜測座標偏移、不停止串流", now)
                 t.position, t.velocity, t.position_at = pos, vel, now
             else:
                 t.position = t.velocity = None
@@ -136,7 +148,7 @@ class Controller(Node):
             if (self.flight.target is not None and t.yaw is not None and math.isfinite(msg.yaw)
                     and now - t.attitude_at < .5
                     and abs(math.remainder(msg.yaw - t.yaw, 2 * math.pi)) > math.radians(30)):
-                self.flight.fault(now, "heading 突然跳變")
+                self.flight.warn("yaw_jump", "heading 跳變超過 30°；只警告，不停止串流", now)
             t.yaw = math.remainder(msg.yaw, 2 * math.pi) if math.isfinite(msg.yaw) else None
             t.attitude_at = now
         elif kind == "EXTENDED_SYS_STATE":
@@ -150,9 +162,11 @@ class Controller(Node):
             # PX4 v1.17 also sets CONST_POS_MODE for vehicle_at_rest. It is
             # not by itself a navigation fault on the ground. All required
             # validity bits and the acceleration-error check still apply.
-            ground_fresh = t.landed == "GROUND" and 0 <= now - t.landed_at < 1.
+            # Age alone is warning-only. A stale GROUND report must not turn an
+            # otherwise unchanged CONST_POS_MODE flag into a new hard fault.
+            ground_known = t.landed == "GROUND"
             bad = M.ESTIMATOR_ACCEL_ERROR
-            if not ground_fresh:
+            if not ground_known:
                 bad |= M.ESTIMATOR_CONST_POS_MODE
             t.estimate_ok = (msg.flags & required == required and bool(msg.flags & horizontal)
                              and not bool(msg.flags & bad))
@@ -176,22 +190,28 @@ class Controller(Node):
     def snapshot(self, now):
         t = self.t
         online = now - t.heartbeat_at < 3
-        position = t.position if now - t.position_at < 0.5 else None
+        position = t.position if now - t.position_at < 0.5 and finite_vector(t.position) else None
         state = dict(phase=self.flight.phase, mode=t.mode if online else "UNKNOWN",
                      armed=t.armed if online else None,
                      landed=t.landed if now - t.landed_at < 2 else "UNKNOWN",
                      yaw_deg=math.degrees(t.yaw) if t.yaw is not None and now - t.attitude_at < 0.5 else None,
-                     speed=math.hypot(*t.velocity) if position is not None else None,
+                     speed=math.hypot(*t.velocity) if position is not None and finite_vector(t.velocity) else None,
                      position_ned=position,
                      target_ned=self.flight.target if self.flight.velocity_ref is None else None,
                      velocity_target_ned=self.flight.velocity_ref,
+                     takeoff_origin_ned=self.flight.takeoff_origin,
+                     xy_from_takeoff_target=(tuple(position[i] - self.flight.takeoff_origin[i] for i in (0, 1))
+                                            if position is not None and self.flight.takeoff_origin is not None else None),
+                     ready_count=self.flight.ready_count,
                      navigation_ok=t.navigation_ok(now),
+                     navigation_valid=t.navigation_valid(),
                      navigation_issues=t.navigation_issues(now),
                      telemetry_age_s=t.telemetry_age_s(now),
                      estimator_flags=t.estimator_flags, estimate_ok=t.estimate_ok,
                      relative_altitude=(self.flight.ground_z - position[2]
                                         if position is not None and self.flight.ground_z is not None else None),
                      online=online, note=self.last_note)
+        state.update(self.flight.diagnostics(now))
         self.states.publish(String(data=json.dumps(state, ensure_ascii=False, allow_nan=False)))
 
     def tick(self):

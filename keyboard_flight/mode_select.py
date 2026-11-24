@@ -1,4 +1,4 @@
-"""Interactive keyboard node. Enter a whole relative NEU vector before publishing."""
+"""Keyboard input: absolute XY coordinates relative to the fixed takeoff target."""
 
 import json
 import math
@@ -11,7 +11,7 @@ def read_request(read=input, display=print):
         return {"mode": mode}
     if mode == "takeoff":
         while True:
-            value = read("起飛高度 m（相對本次起點，至少 0.2；Enter=controller 預設；cancel / land / kill）> ").strip().lower()
+            value = read("起飛高度 m（相對本次起點，大於 0；Enter=controller 預設；cancel / land / kill）> ").strip().lower()
             if value == "cancel":
                 return None
             if value in {"land", "kill"}:
@@ -20,18 +20,19 @@ def read_request(read=input, display=print):
                 return {"mode": "takeoff"}
             try:
                 height = float(value)
-                if not math.isfinite(height) or height < 0.2:
+                if not math.isfinite(height) or height <= 0:
                     raise ValueError
                 return {"mode": "takeoff", "height": height}
             except ValueError:
-                display("高度請輸入至少 0.2 的有限數值，單位公尺。")
+                display("高度請輸入大於 0 的有限數值，單位公尺。")
     if mode != "offboard":
         display("請輸入 0、1、2、3、kill 或 q。")
         return None
     request = {"mode": mode}
-    for axis, direction in (("x", "北"), ("y", "東"), ("z", "上")):
+    display("XY 原點＝本次起飛目標點；Z 維持起飛高度；座標不累加。")
+    for axis, direction in (("x", "北"), ("y", "東")):
         while True:
-            value = read(f"{axis} = 相對位移公尺（正向{direction}，Enter=0，cancel 取消，land 降落，kill 停轉）> ").strip().lower()
+            value = read(f"{axis} = 相對起飛目標原點的座標 m（正向{direction}，Enter=0，cancel 取消，land 降落，kill 停轉）> ").strip().lower()
             if value == "cancel":
                 return None
             if value in {"land", "kill"}:
