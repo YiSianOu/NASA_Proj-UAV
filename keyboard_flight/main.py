@@ -24,7 +24,9 @@ AUTO_MODES = {1: "READY", 2: "TAKEOFF", 3: "LOITER", 4: "MISSION", 5: "RTL", 6: 
 MAIN_MODES = {1: "MANUAL", 2: "ALTCTL", 3: "POSCTL", 5: "ACRO", 6: "OFFBOARD", 7: "STABILIZED"}
 LANDED = {0: "UNKNOWN", 1: "GROUND", 2: "AIR", 3: "TAKING_OFF", 4: "LANDING"}
 RATES = ((M.MAVLINK_MSG_ID_LOCAL_POSITION_NED, 20), (M.MAVLINK_MSG_ID_ATTITUDE, 20),
-         (M.MAVLINK_MSG_ID_ESTIMATOR_STATUS, 4), (M.MAVLINK_MSG_ID_EXTENDED_SYS_STATE, 4))
+         (M.MAVLINK_MSG_ID_ESTIMATOR_STATUS, 4), (M.MAVLINK_MSG_ID_EXTENDED_SYS_STATE, 4),
+         (M.MAVLINK_MSG_ID_POSITION_TARGET_LOCAL_NED, 10),
+         (M.MAVLINK_MSG_ID_ATTITUDE_TARGET, 10))
 POSITION_YAW_MASK = (M.POSITION_TARGET_TYPEMASK_VX_IGNORE | M.POSITION_TARGET_TYPEMASK_VY_IGNORE
                      | M.POSITION_TARGET_TYPEMASK_VZ_IGNORE | M.POSITION_TARGET_TYPEMASK_AX_IGNORE
                      | M.POSITION_TARGET_TYPEMASK_AY_IGNORE | M.POSITION_TARGET_TYPEMASK_AZ_IGNORE
@@ -34,6 +36,131 @@ VELOCITY_YAW_MASK = (M.POSITION_TARGET_TYPEMASK_X_IGNORE | M.POSITION_TARGET_TYP
                      | M.POSITION_TARGET_TYPEMASK_AY_IGNORE | M.POSITION_TARGET_TYPEMASK_AZ_IGNORE
                      | M.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE)
 CHECK_PARAMETERS = ("LNDMC_Z_VEL_MAX", "MPC_Z_VEL_MAX_DN")
+
+
+def source_age_s(stamp, now_boot_ms):
+    if now_boot_ms is None:
+        return None
+    delta = (now_boot_ms - stamp) & 0xffffffff
+    if delta >= 0x80000000:
+        # Small timestamp lead can result from transport/scheduling jitter.
+        return 0. if 0x100000000 - delta <= 100 else math.inf
+    return delta / 1000.
+
+
+class PX4SetpointTelemetry:
+    """Observation only: MAVLink 85, never the companion's outgoing message 84.
+
+    PX4 v1.17 streams vehicle_local_position_setpoint through this message.
+    Individual unused axes are JSON null, not zero and not a fabricated hold.
+    """
+    def __init__(self):
+        self.clear()
+
+    def clear(self):
+        self.sample = None
+        self.received_at = -math.inf
+
+    def receive(self, msg, now):
+        stamp = int(msg.time_boot_ms) & 0xffffffff
+        if self.sample is not None:
+            delta = (stamp - self.sample["time_boot_ms"]) & 0xffffffff
+            if delta == 0 or delta >= 0x80000000:
+                return  # Duplicates / out-of-order packets do not refresh age.
+        mask = int(msg.type_mask)
+        frame = int(msg.coordinate_frame)
+
+        def field(name, ignored):
+            value = float(getattr(msg, name))
+            return value if not mask & ignored and math.isfinite(value) else None
+
+        # Only local NED has the same origin/axes as LOCAL_POSITION_NED.
+        local = frame == M.MAV_FRAME_LOCAL_NED
+        def axes(names, bits):
+            return [field(name, bit) if local else None for name, bit in zip(names, bits)]
+
+        self.sample = dict(
+            time_boot_ms=stamp, coordinate_frame=frame, type_mask=mask,
+            position_ned=axes(("x", "y", "z"), (M.POSITION_TARGET_TYPEMASK_X_IGNORE,
+                M.POSITION_TARGET_TYPEMASK_Y_IGNORE, M.POSITION_TARGET_TYPEMASK_Z_IGNORE)),
+            velocity_ned=axes(("vx", "vy", "vz"), (M.POSITION_TARGET_TYPEMASK_VX_IGNORE,
+                M.POSITION_TARGET_TYPEMASK_VY_IGNORE, M.POSITION_TARGET_TYPEMASK_VZ_IGNORE)),
+            acceleration_or_force_ned=axes(("afx", "afy", "afz"), (M.POSITION_TARGET_TYPEMASK_AX_IGNORE,
+                M.POSITION_TARGET_TYPEMASK_AY_IGNORE, M.POSITION_TARGET_TYPEMASK_AZ_IGNORE)),
+            is_force=bool(mask & M.POSITION_TARGET_TYPEMASK_FORCE_SET),
+            yaw_rad=field("yaw", M.POSITION_TARGET_TYPEMASK_YAW_IGNORE) if local else None,
+            yaw_rate_rad_s=field("yaw_rate", M.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE) if local else None)
+        self.received_at = now
+
+    def snapshot(self, now, now_boot_ms=None):
+        result = dict(source="POSITION_TARGET_LOCAL_NED", message_id=85,
+                      has_received=self.sample is not None, fresh=False, age_s=None,
+                      status="not_received", time_boot_ms=None, coordinate_frame=None,
+                      type_mask=None, position_ned=[None] * 3, velocity_ned=[None] * 3,
+                      acceleration_or_force_ned=[None] * 3, is_force=None,
+                      yaw_rad=None, yaw_rate_rad_s=None)
+        if self.sample is None:
+            return result
+        result.update(self.sample)
+        result["age_s"] = max(0., now - self.received_at)
+        source_age = source_age_s(self.sample["time_boot_ms"], now_boot_ms)
+        result["sample_age_s"] = source_age if source_age is None or math.isfinite(source_age) else None
+        result["fresh"] = result["age_s"] < .5 and (source_age is None or source_age < .5)
+        if not result["fresh"]:
+            result["status"] = "stale"
+        elif result["coordinate_frame"] != M.MAV_FRAME_LOCAL_NED:
+            result["status"] = "unsupported_frame"
+        elif all(v is None for v in result["position_ned"]):
+            result["status"] = "no_position_axes"
+        else:
+            result["status"] = "available"
+        if result["status"] in {"stale", "unsupported_frame"}:
+            for key in ("position_ned", "velocity_ned", "acceleration_or_force_ned"):
+                result[key] = [None] * 3
+            result["yaw_rad"] = result["yaw_rate_rad_s"] = None
+        return result
+
+
+class PX4AttitudeTelemetry(PX4SetpointTelemetry):
+    """MAVLink 83: vehicle_attitude_setpoint quaternion -> NED yaw.
+
+    In rate-only control PX4 may resend an old quaternion with its old timestamp.
+    Do not treat those repeated packets as a new yaw-angle target.
+    """
+    def receive(self, msg, now):
+        stamp = int(msg.time_boot_ms) & 0xffffffff
+        if self.sample is not None:
+            delta = (stamp - self.sample["time_boot_ms"]) & 0xffffffff
+            if delta == 0 or delta >= 0x80000000:
+                return
+        q = tuple(float(v) for v in msg.q)
+        yaw = None
+        mask = int(msg.type_mask)
+        if len(q) == 4 and all(map(math.isfinite, q)) and not mask & M.ATTITUDE_TARGET_TYPEMASK_ATTITUDE_IGNORE:
+            norm = math.hypot(*q)
+            if math.isfinite(norm) and norm > 1e-9:
+                w, x, y, z = (v / norm for v in q)
+                yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        self.sample = dict(time_boot_ms=stamp, type_mask=mask, yaw_rad=yaw)
+        self.received_at = now
+
+    def snapshot(self, now, now_boot_ms=None):
+        result = dict(source="ATTITUDE_TARGET", message_id=83, has_received=self.sample is not None,
+                      fresh=False, age_s=None, sample_age_s=None, status="not_received",
+                      time_boot_ms=None, type_mask=None, yaw_rad=None)
+        if self.sample is None:
+            return result
+        result.update(self.sample)
+        result["age_s"] = max(0., now - self.received_at)
+        source_age = source_age_s(self.sample["time_boot_ms"], now_boot_ms)
+        result["sample_age_s"] = source_age if source_age is None or math.isfinite(source_age) else None
+        result["fresh"] = result["age_s"] < .5 and (source_age is None or source_age < .5)
+        if not result["fresh"]:
+            result["status"] = "stale"
+            result["yaw_rad"] = None
+        else:
+            result["status"] = "available" if result["yaw_rad"] is not None else "no_yaw_angle"
+        return result
 
 
 class Controller(Node):
@@ -46,6 +173,9 @@ class Controller(Node):
         if not (1 <= self.source <= 255 and 1 <= self.system <= 255 and self.source != self.system):
             raise ValueError("source_system 與 target_system 需為相異的 1..255")
         self.t = Telemetry()
+        self.px4_setpoint = PX4SetpointTelemetry()
+        self.px4_attitude_setpoint = PX4AttitudeTelemetry()
+        self.px4_boot_epoch = 0
         self.events = self.create_publisher(String, "/flight/event", 20)
         self.states = self.create_publisher(String, "/flight/state", 10)
         self.last_note = "等待 PX4"
@@ -125,6 +255,9 @@ class Controller(Node):
                 if delta == 0:
                     return
                 if delta >= 0x80000000:
+                    self.px4_setpoint.clear()
+                    self.px4_attitude_setpoint.clear()
+                    self.px4_boot_epoch += 1
                     self.flight.invalidate_frame(now)
                     # Old state belongs to the previous clock/frame epoch. Do not
                     # fabricate a disarm or mode change before a new heartbeat.
@@ -144,6 +277,10 @@ class Controller(Node):
                 t.position, t.velocity, t.position_at = pos, vel, now
             else:
                 t.position = t.velocity = None
+        elif kind == "POSITION_TARGET_LOCAL_NED":
+            self.px4_setpoint.receive(msg, now)
+        elif kind == "ATTITUDE_TARGET":
+            self.px4_attitude_setpoint.receive(msg, now)
         elif kind == "ATTITUDE":
             if (self.flight.target is not None and t.yaw is not None and math.isfinite(msg.yaw)
                     and now - t.attitude_at < .5
@@ -189,6 +326,8 @@ class Controller(Node):
 
     def snapshot(self, now):
         t = self.t
+        now_boot_ms = ((self.boot_ms + int((now - self.boot_received_at) * 1000)) & 0xffffffff
+                       if self.boot_ms is not None and self.boot_received_at is not None else None)
         online = now - t.heartbeat_at < 3
         position = t.position if now - t.position_at < 0.5 and finite_vector(t.position) else None
         state = dict(phase=self.flight.phase, mode=t.mode if online else "UNKNOWN",
@@ -197,6 +336,10 @@ class Controller(Node):
                      yaw_deg=math.degrees(t.yaw) if t.yaw is not None and now - t.attitude_at < 0.5 else None,
                      speed=math.hypot(*t.velocity) if position is not None and finite_vector(t.velocity) else None,
                      position_ned=position,
+                     position_time_boot_ms=self.boot_ms if position is not None else None,
+                     px4_boot_epoch=self.px4_boot_epoch,
+                     px4_setpoint=self.px4_setpoint.snapshot(now, now_boot_ms),
+                     px4_attitude_setpoint=self.px4_attitude_setpoint.snapshot(now, now_boot_ms),
                      target_ned=self.flight.target if self.flight.velocity_ref is None else None,
                      velocity_target_ned=self.flight.velocity_ref,
                      takeoff_origin_ned=self.flight.takeoff_origin,

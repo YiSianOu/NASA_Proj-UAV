@@ -554,6 +554,9 @@ class AdapterTests(unittest.TestCase):
         c.system, c.source = 1, 245
         c.boot_ms = 1000
         c.boot_received_at = 10.
+        c.px4_setpoint = module.PX4SetpointTelemetry()
+        c.px4_attitude_setpoint = module.PX4AttitudeTelemetry()
+        c.px4_boot_epoch = 0
         c.t = Telemetry(mode="OFFBOARD", armed=True, landed="AIR", position=(2., 3., -4.25),
                         velocity=(.1, 0., 0.), yaw=0., estimate_ok=True,
                         heartbeat_at=10., position_at=10., attitude_at=10., landed_at=10., estimator_at=10.)
@@ -605,6 +608,150 @@ class AdapterTests(unittest.TestCase):
         return types.SimpleNamespace(get_srcSystem=lambda: 1,
                                      get_srcComponent=lambda: self.controller_module.M.MAV_COMP_ID_AUTOPILOT1,
                                      get_type=lambda: kind, **fields)
+
+    def setpoint_packet(self, **updates):
+        fields = dict(time_boot_ms=1000, coordinate_frame=self.controller_module.M.MAV_FRAME_LOCAL_NED,
+                      type_mask=0, x=10., y=20., z=-.25, vx=.1, vy=.2, vz=.3,
+                      afx=0., afy=0., afz=0., yaw=.5, yaw_rate=.01)
+        fields.update(updates)
+        return self.packet("POSITION_TARGET_LOCAL_NED", **fields)
+
+    def test_px4_setpoint_request_and_independent_received_source(self):
+        c = self.make_controller()
+        self.assertIn((self.controller_module.M.MAVLINK_MSG_ID_POSITION_TARGET_LOCAL_NED, 10),
+                      self.controller_module.RATES)
+        before = c.flight.target
+        c.receive(self.setpoint_packet(), 10.)
+        c.snapshot(10.)
+        state = json.loads(c.states.publish.call_args.args[0].data)
+        self.assertEqual(state["target_ned"], list(before))
+        self.assertEqual(state["px4_setpoint"]["position_ned"], [10., 20., -.25])
+        self.assertEqual(state["px4_setpoint"]["message_id"], 85)
+        self.assertEqual(state["px4_setpoint"]["status"], "available")
+        self.assertEqual(state["position_time_boot_ms"], 1000)
+        self.assertEqual(c.flight.phase, "HOLD")
+        c.flight.send_command.assert_not_called()
+        c.flight.send_target.assert_not_called()
+
+    def test_px4_partial_axes_and_nonfinite_values_are_json_null(self):
+        c = self.make_controller()
+        m = self.controller_module.M
+        c.receive(self.setpoint_packet(type_mask=m.POSITION_TARGET_TYPEMASK_X_IGNORE,
+                                      y=math.nan, vx=math.inf, yaw=math.nan), 10.)
+        c.snapshot(10.)
+        sp = json.loads(c.states.publish.call_args.args[0].data)["px4_setpoint"]
+        self.assertEqual(sp["position_ned"], [None, None, -.25])
+        self.assertEqual(sp["velocity_ned"], [None, .2, .3])
+        self.assertIsNone(sp["yaw_rad"])
+
+    def test_px4_inactive_axes_differ_from_no_packet_and_stale(self):
+        c = self.make_controller()
+        self.assertEqual(c.px4_setpoint.snapshot(10.)["status"], "not_received")
+        m = self.controller_module.M
+        mask = m.POSITION_TARGET_TYPEMASK_X_IGNORE | m.POSITION_TARGET_TYPEMASK_Y_IGNORE | m.POSITION_TARGET_TYPEMASK_Z_IGNORE
+        c.receive(self.setpoint_packet(type_mask=mask), 10.)
+        sp = c.px4_setpoint.snapshot(10.1)
+        self.assertEqual(sp["status"], "no_position_axes")
+        self.assertEqual(sp["velocity_ned"], [.1, .2, .3])
+        sp = c.px4_setpoint.snapshot(10.5)
+        self.assertEqual(sp["status"], "stale")
+        self.assertEqual(sp["velocity_ned"], [None] * 3)
+        self.assertTrue(sp["has_received"])
+
+    def test_px4_wrong_sender_and_unsupported_frame_do_not_plot_wrong_coordinates(self):
+        c = self.make_controller()
+        msg = self.setpoint_packet()
+        msg.get_srcSystem = lambda: 99
+        c.receive(msg, 10.)
+        self.assertIsNone(c.px4_setpoint.sample)
+        c.receive(self.setpoint_packet(coordinate_frame=-1), 10.)
+        sp = c.px4_setpoint.snapshot(10.)
+        self.assertEqual(sp["status"], "unsupported_frame")
+        self.assertEqual(sp["position_ned"], [None] * 3)
+
+    def test_px4_repeated_and_old_timestamps_do_not_refresh_a_stale_target(self):
+        c = self.make_controller()
+        c.receive(self.setpoint_packet(), 10.)
+        c.receive(self.setpoint_packet(), 10.6)
+        c.receive(self.setpoint_packet(time_boot_ms=999), 10.7)
+        self.assertEqual(c.px4_setpoint.snapshot(10.7)["status"], "stale")
+        c.receive(self.setpoint_packet(time_boot_ms=1100), 10.8)
+        self.assertTrue(c.px4_setpoint.snapshot(10.8)["fresh"])
+
+    def test_px4_setpoint_clock_wrap_is_not_rejected(self):
+        c = self.make_controller()
+        c.receive(self.setpoint_packet(time_boot_ms=0xfffffff0), 10.)
+        c.receive(self.setpoint_packet(time_boot_ms=16), 10.1)
+        self.assertEqual(c.px4_setpoint.snapshot(10.1)["time_boot_ms"], 16)
+
+    def test_px4_reset_clears_setpoint_and_starts_a_new_display_epoch(self):
+        c = self.make_controller()
+        c.receive(self.setpoint_packet(), 10.)
+        c.receive(self.packet("LOCAL_POSITION_NED", time_boot_ms=100, x=2., y=3., z=-4.,
+                              vx=0., vy=0., vz=0.), 10.1)
+        self.assertIsNone(c.px4_setpoint.sample)
+        self.assertEqual(c.px4_boot_epoch, 1)
+        c.receive(self.setpoint_packet(time_boot_ms=150), 10.2)
+        self.assertEqual(c.px4_setpoint.snapshot(10.2)["time_boot_ms"], 150)
+
+    def attitude_target_packet(self, **updates):
+        yaw = math.radians(60.)
+        values = dict(time_boot_ms=1000, type_mask=0, q=[math.cos(yaw / 2), 0., 0., math.sin(yaw / 2)])
+        values.update(updates)
+        return self.packet("ATTITUDE_TARGET", **values)
+
+    def test_attitude_target_decodes_ned_yaw_in_rc_modes(self):
+        for mode in ("POSCTL", "ALTCTL", "STABILIZED", "OFFBOARD"):
+            c = self.make_controller()
+            c.t.mode = mode
+            c.flight.phase = "PX4_CONTROL"
+            c.receive(self.attitude_target_packet(), 10.)
+            c.snapshot(10.)
+            sp = json.loads(c.states.publish.call_args.args[0].data)["px4_attitude_setpoint"]
+            self.assertAlmostEqual(sp["yaw_rad"], math.radians(60.))
+            self.assertTrue(sp["fresh"])
+            self.assertEqual(sp["source"], "ATTITUDE_TARGET")
+            c.flight.send_command.assert_not_called()
+
+    def test_attitude_ignore_bad_quaternion_and_nan_do_not_fabricate_yaw(self):
+        for updates in ({"q": [0., 0., 0., 0.]}, {"q": [math.nan, 0., 0., 0.]},
+                        {"type_mask": self.controller_module.M.ATTITUDE_TARGET_TYPEMASK_ATTITUDE_IGNORE}):
+            c = self.make_controller()
+            c.receive(self.attitude_target_packet(**updates), 10.)
+            sp = c.px4_attitude_setpoint.snapshot(10.)
+            self.assertEqual(sp["status"], "no_yaw_angle")
+            self.assertIsNone(sp["yaw_rad"])
+
+    def test_repeated_attitude_timestamp_in_rate_only_mode_expires(self):
+        c = self.make_controller()
+        c.receive(self.attitude_target_packet(), 10.)
+        c.receive(self.attitude_target_packet(), 10.6)
+        sp = c.px4_attitude_setpoint.snapshot(10.6)
+        self.assertEqual(sp["status"], "stale")
+        self.assertIsNone(sp["yaw_rad"])
+
+    def test_first_packet_with_old_px4_sample_time_is_already_stale(self):
+        c = self.make_controller()
+        c.receive(self.attitude_target_packet(time_boot_ms=100), 10.)
+        c.receive(self.setpoint_packet(time_boot_ms=100), 10.)
+        c.snapshot(10.)
+        data = json.loads(c.states.publish.call_args.args[0].data)
+        self.assertEqual(data["px4_attitude_setpoint"]["status"], "stale")
+        self.assertIsNone(data["px4_attitude_setpoint"]["yaw_rad"])
+        self.assertEqual(data["px4_setpoint"]["status"], "stale")
+
+    def test_attitude_source_age_wrap_jitter_and_wrong_epoch(self):
+        age = self.controller_module.source_age_s
+        self.assertAlmostEqual(age(0xfffffff0, 16), .032)
+        self.assertEqual(age(1020, 1000), 0.)
+        self.assertEqual(age(2000, 1000), math.inf)
+
+    def test_timestamp_reset_also_clears_attitude_target(self):
+        c = self.make_controller()
+        c.receive(self.attitude_target_packet(), 10.)
+        c.receive(self.packet("LOCAL_POSITION_NED", time_boot_ms=100, x=2., y=3., z=-4.,
+                              vx=0., vy=0., vz=0.), 10.1)
+        self.assertIsNone(c.px4_attitude_setpoint.sample)
 
     def test_position_and_yaw_jump_packets_do_not_clear_stream(self):
         c = self.make_controller()
