@@ -5,17 +5,17 @@ import math
 import uuid
 
 def read_request(read=input, display=print):
-    choice = read("[0 解鎖 / 1 起飛 / 2 追蹤 / 3 降落 / kill 緊急停轉 / q 離開] > ").strip().lower()
-    mode = {"0": "arm", "1": "takeoff", "2": "offboard", "3": "land", "q": "quit"}.get(choice, choice)
+    choice = read("[0 解鎖 / 1 起飛 / 2 追蹤 / 3 降落 / k 緊急停轉 / q 離開] > ").strip().lower()
+    mode = {"0": "arm", "1": "takeoff", "2": "offboard", "3": "land", "k": "kill", "q": "quit"}.get(choice, choice)
     if mode in {"arm", "land", "kill", "quit"}:
         return {"mode": mode}
     if mode == "takeoff":
         while True:
-            value = read("起飛高度 m（相對本次起點，大於 0；Enter=controller 預設；cancel / land / kill）> ").strip().lower()
+            value = read("起飛高度 m（相對本次起點，大於 0；Enter=controller 預設；cancel / land / k）> ").strip().lower()
             if value == "cancel":
                 return None
-            if value in {"land", "kill"}:
-                return {"mode": value}
+            if value in {"land", "kill", "k"}:
+                return {"mode": "kill" if value == "k" else value}
             if value == "":
                 return {"mode": "takeoff"}
             try:
@@ -26,17 +26,17 @@ def read_request(read=input, display=print):
             except ValueError:
                 display("高度請輸入大於 0 的有限數值，單位公尺。")
     if mode != "offboard":
-        display("請輸入 0、1、2、3、kill 或 q。")
+        display("請輸入 0、1、2、3、k 或 q。")
         return None
     request = {"mode": mode}
     display("XY 原點＝本次起飛目標點；Z 維持起飛高度；座標不累加。")
     for axis, direction in (("x", "北"), ("y", "東")):
         while True:
-            value = read(f"{axis} = 相對起飛目標原點的座標 m（正向{direction}，Enter=0，cancel 取消，land 降落，kill 停轉）> ").strip().lower()
+            value = read(f"{axis} = 相對起飛目標原點的座標 m（正向{direction}，Enter=0，cancel 取消，land 降落，k 停轉）> ").strip().lower()
             if value == "cancel":
                 return None
-            if value in {"land", "kill"}:
-                return {"mode": value}
+            if value in {"land", "kill", "k"}:
+                return {"mode": "kill" if value == "k" else value}
             try:
                 number = float(value or 0)
                 if not math.isfinite(number):
